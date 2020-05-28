@@ -26,7 +26,7 @@ import sys
 from .libbcc import lib, bcc_symbol, bcc_symbol_option, bcc_stacktrace_build_id, _SYM_CB_TYPE
 from .table import Table, PerfEventArray
 from .perf import Perf
-from .utils import get_online_cpus, printb, _assert_is_bytes, ArgString
+from .utils import get_online_cpus, printb, _assert_is_bytes, ArgString, StrcmpRewrite
 from .version import __version__
 from .disassembler import disassemble_prog, decode_map
 
@@ -156,6 +156,8 @@ class BPF(object):
     SK_MSG = 16
     RAW_TRACEPOINT = 17
     CGROUP_SOCK_ADDR = 18
+    TRACING = 26
+    LSM = 29
 
     # from xdp_action uapi/linux/bpf.h
     XDP_ABORTED = 0
@@ -163,6 +165,10 @@ class BPF(object):
     XDP_PASS = 2
     XDP_TX = 3
     XDP_REDIRECT = 4
+
+    # from bpf_attach_type uapi/linux/bpf.h
+    TRACE_FENTRY = 24
+    TRACE_FEXIT  = 25
 
     _probe_repl = re.compile(b"[^a-zA-Z0-9_]")
     _sym_caches = {}
@@ -182,6 +188,8 @@ class BPF(object):
         b"__x32_compat_sys_",
         b"__ia32_compat_sys_",
         b"__arm64_sys_",
+        b"__s390x_sys_",
+        b"__s390_sys_",
     ]
 
     # BPF timestamps come from the monotonic clock. To be able to filter
@@ -301,6 +309,8 @@ class BPF(object):
         self.uprobe_fds = {}
         self.tracepoint_fds = {}
         self.raw_tracepoint_fds = {}
+        self.kfunc_entry_fds = {}
+        self.kfunc_exit_fds = {}
         self.perf_buffers = {}
         self.open_perf_events = {}
         self.tracefile = None
@@ -742,7 +752,7 @@ class BPF(object):
 
 
     @classmethod
-    def _check_path_symbol(cls, module, symname, addr, pid):
+    def _check_path_symbol(cls, module, symname, addr, pid, sym_off=0):
         module = _assert_is_bytes(module)
         symname = _assert_is_bytes(symname)
         sym = bcc_symbol()
@@ -754,9 +764,10 @@ class BPF(object):
             ct.byref(sym),
         ) < 0:
             raise Exception("could not determine address of symbol %s" % symname)
+        new_addr = sym.offset + sym_off
         module_path = ct.cast(sym.module, ct.c_char_p).value
         lib.bcc_procutils_free(sym.module)
-        return module_path, sym.offset
+        return module_path, new_addr
 
     @staticmethod
     def find_library(libname):
@@ -867,6 +878,67 @@ class BPF(object):
         del self.raw_tracepoint_fds[tp]
 
     @staticmethod
+    def add_prefix(prefix, name):
+        if not name.startswith(prefix):
+            name = prefix + name
+        return name
+
+    @staticmethod
+    def support_kfunc():
+        if not lib.bpf_has_kernel_btf():
+            return False;
+        # kernel symbol "bpf_trampoline_link_prog" indicates kfunc support
+        if BPF.ksymname("bpf_trampoline_link_prog") != -1:
+            return True
+        return False
+
+    def detach_kfunc(self, fn_name=b""):
+        fn_name = _assert_is_bytes(fn_name)
+        fn_name = BPF.add_prefix(b"kfunc__", fn_name)
+
+        if fn_name not in self.kfunc_entry_fds:
+            raise Exception("Kernel entry func %s is not attached" % fn_name)
+        os.close(self.kfunc_entry_fds[fn_name])
+        del self.kfunc_entry_fds[fn_name]
+
+    def detach_kretfunc(self, fn_name=b""):
+        fn_name = _assert_is_bytes(fn_name)
+        fn_name = BPF.add_prefix(b"kretfunc__", fn_name)
+
+        if fn_name not in self.kfunc_exit_fds:
+            raise Exception("Kernel exit func %s is not attached" % fn_name)
+        os.close(self.kfunc_exit_fds[fn_name])
+        del self.kfunc_exit_fds[fn_name]
+
+    def attach_kfunc(self, fn_name=b""):
+        fn_name = _assert_is_bytes(fn_name)
+        fn_name = BPF.add_prefix(b"kfunc__", fn_name)
+
+        if fn_name in self.kfunc_entry_fds:
+            raise Exception("Kernel entry func %s has been attached" % fn_name)
+
+        fn = self.load_func(fn_name, BPF.TRACING)
+        fd = lib.bpf_attach_kfunc(fn.fd)
+        if fd < 0:
+            raise Exception("Failed to attach BPF to entry kernel func")
+        self.kfunc_entry_fds[fn_name] = fd;
+        return self
+
+    def attach_kretfunc(self, fn_name=b""):
+        fn_name = _assert_is_bytes(fn_name)
+        fn_name = BPF.add_prefix(b"kretfunc__", fn_name)
+
+        if fn_name in self.kfunc_exit_fds:
+            raise Exception("Kernel exit func %s has been attached" % fn_name)
+
+        fn = self.load_func(fn_name, BPF.TRACING)
+        fd = lib.bpf_attach_kfunc(fn.fd)
+        if fd < 0:
+            raise Exception("Failed to attach BPF to exit kernel func")
+        self.kfunc_exit_fds[fn_name] = fd;
+        return self
+
+    @staticmethod
     def support_raw_tracepoint():
         # kernel symbol "bpf_find_raw_tracepoint" indicates raw_tracepoint support
         if BPF.ksymname("bpf_find_raw_tracepoint") != -1 or \
@@ -974,13 +1046,15 @@ class BPF(object):
             return b"%s_%s_0x%x_%d" % (prefix, self._probe_repl.sub(b"_", path), addr, pid)
 
     def attach_uprobe(self, name=b"", sym=b"", sym_re=b"", addr=None,
-            fn_name=b"", pid=-1):
+            fn_name=b"", pid=-1, sym_off=0):
         """attach_uprobe(name="", sym="", sym_re="", addr=None, fn_name=""
-                         pid=-1)
+                         pid=-1, sym_off=0)
 
         Run the bpf function denoted by fn_name every time the symbol sym in
         the library or binary 'name' is encountered. Optional parameters pid,
         cpu, and group_fd can be used to filter the probe.
+
+        If sym_off is given, attach uprobe to offset within the symbol.
 
         The real address addr may be supplied in place of sym, in which case sym
         must be set to its default value. If the file is a non-PIE executable,
@@ -1000,6 +1074,10 @@ class BPF(object):
                  BPF(text).attach_uprobe("/usr/bin/python", "main")
         """
 
+        assert sym_off >= 0
+        if addr is not None:
+            assert sym_off == 0, "offset with addr is not supported"
+
         name = _assert_is_bytes(name)
         sym = _assert_is_bytes(sym)
         sym_re = _assert_is_bytes(sym_re)
@@ -1013,7 +1091,7 @@ class BPF(object):
                                    fn_name=fn_name, pid=pid)
             return
 
-        (path, addr) = BPF._check_path_symbol(name, sym, addr, pid)
+        (path, addr) = BPF._check_path_symbol(name, sym, addr, pid, sym_off)
 
         self._check_probe_quota(1)
         fn = self.load_func(fn_name, BPF.KPROBE)
@@ -1067,7 +1145,7 @@ class BPF(object):
             raise Exception("Failed to detach BPF from uprobe")
         self._del_uprobe_fd(ev_name)
 
-    def detach_uprobe(self, name=b"", sym=b"", addr=None, pid=-1):
+    def detach_uprobe(self, name=b"", sym=b"", addr=None, pid=-1, sym_off=0):
         """detach_uprobe(name="", sym="", addr=None, pid=-1)
 
         Stop running a bpf function that is attached to symbol 'sym' in library
@@ -1076,7 +1154,7 @@ class BPF(object):
 
         name = _assert_is_bytes(name)
         sym = _assert_is_bytes(sym)
-        (path, addr) = BPF._check_path_symbol(name, sym, addr, pid)
+        (path, addr) = BPF._check_path_symbol(name, sym, addr, pid, sym_off)
         ev_name = self._get_uprobe_evname(b"p", path, addr, pid)
         self.detach_uprobe_event(ev_name)
 
@@ -1115,6 +1193,10 @@ class BPF(object):
                 fn = self.load_func(func_name, BPF.RAW_TRACEPOINT)
                 tp = fn.name[len(b"raw_tracepoint__"):]
                 self.attach_raw_tracepoint(tp=tp, fn_name=fn.name)
+            elif func_name.startswith(b"kfunc__"):
+                self.attach_kfunc(fn_name=func_name)
+            elif func_name.startswith(b"kretfunc__"):
+                self.attach_kretfunc(fn_name=func_name)
 
     def trace_open(self, nonblocking=False):
         """trace_open(nonblocking=False)
@@ -1344,6 +1426,10 @@ class BPF(object):
             self.detach_tracepoint(k)
         for k, v in list(self.raw_tracepoint_fds.items()):
             self.detach_raw_tracepoint(k)
+        for k, v in list(self.kfunc_entry_fds.items()):
+            self.detach_kfunc(k)
+        for k, v in list(self.kfunc_exit_fds.items()):
+            self.detach_kretfunc(k)
 
         # Clean up opened perf ring buffer and perf events
         table_keys = list(self.tables.keys())
@@ -1357,6 +1443,7 @@ class BPF(object):
             self.tracefile = None
         for name, fn in list(self.funcs.items()):
             os.close(fn.fd)
+            del self.funcs[name]
         if self.module:
             lib.bpf_module_destroy(self.module)
             self.module = None

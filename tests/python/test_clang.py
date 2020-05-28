@@ -80,7 +80,7 @@ int count_foo(struct pt_regs *ctx, unsigned long a, unsigned long b) {
         text = """
 #define KBUILD_MODNAME "foo"
 #include <net/tcp.h>
-#define _(P) ({typeof(P) val = 0; bpf_probe_read(&val, sizeof(val), &P); val;})
+#define _(P) ({typeof(P) val = 0; bpf_probe_read_kernel(&val, sizeof(val), &P); val;})
 int count_tcp(struct pt_regs *ctx, struct sk_buff *skb) {
     return _(TCP_SKB_CB(skb)->tcp_gso_size);
 }
@@ -92,7 +92,7 @@ int count_tcp(struct pt_regs *ctx, struct sk_buff *skb) {
         text = """
 #define KBUILD_MODNAME "foo"
 #include <net/tcp.h>
-#define _(P) ({typeof(P) val = 0; bpf_probe_read(&val, sizeof(val), &P); val;})
+#define _(P) ({typeof(P) val = 0; bpf_probe_read_kernel(&val, sizeof(val), &P); val;})
 int test(struct pt_regs *ctx, struct sk_buff *skb) {
     return _(TCP_SKB_CB(skb)->tcp_gso_size) + skb->protocol;
 }
@@ -111,7 +111,7 @@ int count_tcp(struct pt_regs *ctx, struct sk_buff *skb) {
     // failing below statement
     // return TCP_SKB_CB(skb)->tcp_gso_size;
     u16 val = 0;
-    bpf_probe_read(&val, sizeof(val), &(TCP_SKB_CB(skb)->tcp_gso_size));
+    bpf_probe_read_kernel(&val, sizeof(val), &(TCP_SKB_CB(skb)->tcp_gso_size));
     return val;
 }
 """
@@ -129,7 +129,7 @@ int count_tcp(struct pt_regs *ctx, struct sk_buff *skb) {
     // failing below statement
     // return TCP_SKB_CB(skb)->tcp_gso_size;
     u16 val = 0;
-    bpf_probe_read(&val, sizeof(val), &(TCP_SKB_CB(skb)->tcp_gso_size));
+    bpf_probe_read_kernel(&val, sizeof(val), &(TCP_SKB_CB(skb)->tcp_gso_size));
     return val + skb->protocol;
 }
 """
@@ -323,6 +323,18 @@ int kprobe__blk_update_request(struct pt_regs *ctx, struct request *req) {
     return 0;
 }""")
 
+    @skipUnless(kernel_version_ge(5,7), "requires kernel >= 5.7")
+    def test_lsm_probe(self):
+        b = BPF(text="""
+LSM_PROBE(bpf, int cmd, union bpf_attr *uattr, unsigned int size) {
+    return 0;
+}""")
+        # depending on CONFIG_BPF_LSM being compiled in
+        try:
+            b.load_func("lsm__bpf", BPF.LSM)
+        except:
+            pass
+
     def test_probe_read_helper(self):
         b = BPF(text="""
 #include <linux/fs.h>
@@ -396,7 +408,7 @@ int kprobe__finish_task_switch(struct pt_regs *ctx, struct task_struct *prev) {
   key.curr_pid = bpf_get_current_pid_tgid();
   key.prev_pid = prev->pid;
 
-  val = stats.lookup_or_init(&key, &zero);
+  val = stats.lookup_or_try_init(&key, &zero);
   if (val) {
     (*val)++;
   }
@@ -499,7 +511,34 @@ int test(struct pt_regs *ctx, struct sock *sk) {
         b = BPF(text=text)
         fn = b.load_func("test", BPF.KPROBE)
 
-    def test_probe_read_nested_deref_func(self):
+    def test_probe_read_nested_deref3(self):
+        text = """
+#include <net/inet_sock.h>
+int test(struct pt_regs *ctx, struct sock *sk) {
+    struct sock **ptr1, **ptr2 = &sk;
+    ptr1 = &sk;
+    return (*ptr1)->sk_daddr + (*ptr2)->sk_daddr;
+}
+"""
+        b = BPF(text=text)
+        fn = b.load_func("test", BPF.KPROBE)
+
+    def test_probe_read_nested_deref_func1(self):
+        text = """
+#include <net/inet_sock.h>
+static struct sock **subtest(struct sock **sk) {
+    return sk;
+}
+int test(struct pt_regs *ctx, struct sock *sk) {
+    struct sock **ptr1, **ptr2 = subtest(&sk);
+    ptr1 = subtest(&sk);
+    return (*ptr1)->sk_daddr + (*ptr2)->sk_daddr;
+}
+"""
+        b = BPF(text=text)
+        fn = b.load_func("test", BPF.KPROBE)
+
+    def test_probe_read_nested_deref_func2(self):
         text = """
 #include <net/inet_sock.h>
 static int subtest(struct sock ***skp) {
@@ -944,6 +983,7 @@ struct a {
 BPF_HASH(drops, struct a);
         """
         b = BPF(text=text)
+        t = b['drops']
 
     def test_int128_types(self):
         text = """
@@ -1116,7 +1156,7 @@ int test(struct pt_regs *ctx, struct sock *sk, struct sk_buff *skb) {
 #include <net/inet_sock.h>
 static inline int test_help(__be16 *addr) {
     __be16 val = 0;
-    bpf_probe_read(&val, sizeof(val), addr);
+    bpf_probe_read_kernel(&val, sizeof(val), addr);
     return val;
 }
 int test(struct pt_regs *ctx) {

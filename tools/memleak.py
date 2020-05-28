@@ -287,7 +287,7 @@ int posix_memalign_exit(struct pt_regs *ctx) {
 
         memptrs.delete(&pid);
 
-        if (bpf_probe_read(&addr, sizeof(void*), (void*)(size_t)*memptr64))
+        if (bpf_probe_read_user(&addr, sizeof(void*), (void*)(size_t)*memptr64))
                 return 0;
 
         u64 addr64 = (u64)(size_t)addr;
@@ -399,7 +399,7 @@ elif max_size is not None:
         size_filter = "if (size > %d) return 0;" % max_size
 bpf_source = bpf_source.replace("SIZE_FILTER", size_filter)
 
-stack_flags = "BPF_F_REUSE_STACKID"
+stack_flags = "0"
 if not kernel_trace:
         stack_flags += "|BPF_F_USER_STACK"
 bpf_source = bpf_source.replace("STACK_FLAGS", stack_flags)

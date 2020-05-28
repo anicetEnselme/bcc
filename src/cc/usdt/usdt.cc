@@ -420,10 +420,10 @@ void *bcc_usdt_new_frompid(int pid, const char *path) {
   } else {
     struct stat buffer;
     if (strlen(path) >= 1 && path[0] != '/') {
-      fprintf(stderr, "HINT: Binary path should be absolute.\n\n");
+      fprintf(stderr, "HINT: Binary path %s should be absolute.\n\n", path);
       return nullptr;
     } else if (stat(path, &buffer) == -1) {
-      fprintf(stderr, "HINT: Specified binary doesn't exist.\n\n");
+      fprintf(stderr, "HINT: Specified binary %s doesn't exist.\n\n", path);
       return nullptr;
     }
     ctx = new USDT::Context(pid, path);
@@ -501,6 +501,15 @@ const char *bcc_usdt_get_probe_argctype(
   void *ctx, const char* probe_name, const int arg_index
 ) {
   USDT::Probe *p = static_cast<USDT::Context *>(ctx)->get(probe_name);
+  if (p)
+    return p->get_arg_ctype(arg_index).c_str();
+  return "";
+}
+
+const char *bcc_usdt_get_fully_specified_probe_argctype(
+  void *ctx, const char* provider_name, const char* probe_name, const int arg_index
+) {
+  USDT::Probe *p = static_cast<USDT::Context *>(ctx)->get(provider_name, probe_name);
   if (p)
     return p->get_arg_ctype(arg_index).c_str();
   return "";
